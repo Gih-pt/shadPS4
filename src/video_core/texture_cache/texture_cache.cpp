@@ -219,6 +219,24 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
 }
 
 void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
+    // TEMPORARY DIAGNOSTIC (do not commit): shows which cached images a raw buffer write covers.
+    static u32 diag_budget = 400;
+    if (diag_budget != 0) {
+        --diag_budget;
+        u32 count = 0;
+        LOG_INFO(Render_Vulkan, "[YTDIAG] gpu write base={:#x} size={:#x}", address, max_size);
+        ForEachImageInRegion(address, max_size, [&](ImageId, Image& image) {
+            if (count++ < 24) {
+                LOG_INFO(
+                    Render_Vulkan,
+                    "[YTDIAG]   image addr={:#x} size={:#x} {}x{} fmt={} flags={:#x} at_base={}",
+                    image.info.guest_address, u64(image.info.guest_size), image.info.size.width,
+                    image.info.size.height, u32(image.info.pixel_format), u32(image.flags),
+                    image.info.guest_address == address);
+            }
+        });
+        LOG_INFO(Render_Vulkan, "[YTDIAG]   total images in range: {}", count);
+    }
     // Mark the image at the written address, then follow images stored right after it
     // (e.g. the chroma planes after a luma plane).
     const VAddr end = address + max_size;
