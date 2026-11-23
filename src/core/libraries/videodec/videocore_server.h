@@ -20,7 +20,13 @@ struct OrbisVideoCoreAcquireDecoderResourceParam {
 };
 static_assert(sizeof(OrbisVideoCoreAcquireDecoderResourceParam) == 0x10);
 
-using OrbisVideoCoreCallback = void(PS4_SYSV_ABI*)(u32 res_id, u64 user_data);
+// Status values the VideoCore server reports to the client through the resource callback.
+// Reverse engineered from the client state machine in libSceVideoNativeExtEssential: the decoder
+// instance creation only succeeds once the callback has been invoked with status 0 for its
+// resource id (it waits up to 5 seconds for it and otherwise releases the resource and fails).
+constexpr u32 ORBIS_VIDEO_CORE_RESOURCE_STATUS_GRANTED = 0;
+
+using OrbisVideoCoreCallback = void(PS4_SYSV_ABI*)(u32 res_id, u32 status);
 
 s32 PS4_SYSV_ABI
 sceVideoCoreAcquireDecoderResource(const OrbisVideoCoreAcquireDecoderResourceParam* param,

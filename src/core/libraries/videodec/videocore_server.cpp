@@ -1,9 +1,16 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <mutex>
+#include <stop_token>
+#include <thread>
 #include <unordered_map>
 #include "common/logging/log.h"
+#include "common/thread.h"
+#include "core/libraries/kernel/threads.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/videodec/videocore_server.h"
 #include "core/libraries/videodec/videodec_error.h"
@@ -17,11 +24,26 @@ struct VideoCoreResource {
     OrbisVideoCoreCallback callback;
 };
 
+// The real VideoCore server lives in another process and reports resource events back to the
+// client asynchronously. Clients register their decoder instance only after the acquire call
+// returns, so the event must never be delivered from inside the acquire call itself. This models
+// the latency of that round trip.
+constexpr std::chrono::milliseconds EVENT_DELIVERY_LATENCY{10};
+
+struct VideoCoreEvent {
+    u32 id;
+    OrbisVideoCoreCallback callback;
+    u32 status;
+    std::chrono::steady_clock::time_point deliver_at;
+};
+
 class VideoCoreResourceManager {
 public:
     static VideoCoreResourceManager& Instance() {
-        static VideoCoreResourceManager instance;
-        return instance;
+        // Intentionally leaked: the event thread is a guest thread that can't be joined safely
+        // during static destruction.
+        static auto* instance = new VideoCoreResourceManager();
+        return *instance;
     }
 
     s32 AcquireResource(const OrbisVideoCoreAcquireDecoderResourceParam* param,
@@ -45,6 +67,18 @@ public:
                  "Acquired VideoCore {} decoder resource id={}, res_type={}, dim={}x{}, spec={}",
                  is_be_wrapper ? "BeWrapper" : "Standard", id, param->resource_type,
                  param->max_width, param->max_height, param->stream_spec);
+
+        // Tell the client the resource is now usable.
+        events.push_back(VideoCoreEvent{
+            .id = id,
+            .callback = cb,
+            .status = ORBIS_VIDEO_CORE_RESOURCE_STATUS_GRANTED,
+            .deliver_at = std::chrono::steady_clock::now() + EVENT_DELIVERY_LATENCY,
+        });
+        if (!event_thread.Joinable()) {
+            event_thread.Run([this](const std::stop_token& stop) { EventThread(stop); });
+        }
+        event_cv.notify_one();
 
         return ORBIS_OK;
     }
@@ -81,9 +115,42 @@ public:
     }
 
 private:
+    void EventThread(const std::stop_token& stop) {
+        Common::SetCurrentThreadName("shadPS4:VideoCoreEvents");
+
+        while (!stop.stop_requested()) {
+            VideoCoreEvent event;
+            {
+                std::unique_lock lock(mutex);
+                if (!event_cv.wait(lock, stop, [this] { return !events.empty(); })) {
+                    break;
+                }
+                event = events.front();
+                events.pop_front();
+            }
+
+            std::this_thread::sleep_until(event.deliver_at);
+
+            {
+                // The client may have released the resource while the event was in flight.
+                std::unique_lock lock(mutex);
+                if (!resources.contains(event.id)) {
+                    LOG_DEBUG(Lib_Videodec, "Dropping event for released resource id={}", event.id);
+                    continue;
+                }
+            }
+
+            LOG_DEBUG(Lib_Videodec, "Notifying resource id={} status={}", event.id, event.status);
+            event.callback(event.id, event.status);
+        }
+    }
+
     std::mutex mutex;
     u32 next_id{1};
     std::unordered_map<u32, VideoCoreResource> resources;
+    std::deque<VideoCoreEvent> events;
+    std::condition_variable_any event_cv;
+    Kernel::Thread event_thread;
 };
 
 s32 PS4_SYSV_ABI
